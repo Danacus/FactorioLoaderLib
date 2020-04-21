@@ -16,6 +16,22 @@ function endswith(s, sub)
     return string.sub(s, -string.len(sub)) == sub
 end
 
+function newer_than(v1, v2)
+  function parse(v)
+    local matcher = string.gmatch(str, "[^%.")
+    return {
+      major = tonumber(matcher()),
+      minor = tonumber(matcher()),
+      version = tonumber(matcher()),
+    }
+  end
+
+  v1 = parse(v1)
+  v2 = parse(v2)
+
+  return v1.major > v2.major or v1.minor > v2.minor or v1.patch > v2.patch
+end
+
 --- Loads Factorio data files from a list of mods.
 -- executes all module loaders (data.lua),
 -- they do some stuff and extend the global variable "data",
@@ -27,6 +43,33 @@ function Loader.load_data(game_path, mod_dir)
     local filenames = {"data", "data-updates", "data-final-fixes"}
 
     local module_info = {}
+    setmetatable(module_info, {
+        __call = function(t, name)
+          local found, e, parsed_mod = string.find(name, "^__(.*)__[%./]")
+          if found then
+            local info = t[parsed_mod]
+            if info == nil then
+              return "\n        " .. name .. " doesn't look like a registered mod (cross-mod searcher)"
+            end
+            if info.zip_path ~= nil then
+              info = ZipModLoader.new(info.mod_path, info.mod_name, info.arc_subfolder)
+            end
+            local mod = info(string.sub(name, e + 1))
+            if type(mod) == "string" then
+              if info.close ~= nil then info:close() end
+              return "\n        (cross-mod searcher): " .. mod
+            end
+
+            return function()
+              table.insert(package.searchers, 1, info)
+              local result = mod()
+              if info.close ~= nil then info:close() end
+              table.remove(package.searchers, 1)
+              return result
+            end
+          end
+        end
+    })
     local order
 
     settings = SettingLoader.load(mod_dir .. "/mod-settings.dat")
@@ -36,8 +79,8 @@ function Loader.load_data(game_path, mod_dir)
     end
     local modlist = Loader.getModList(mod_dir)
     for filename in lfs.dir(mod_dir) do
-        local mod_name = string.gsub(filename, "(.+)_[^_]+", "%1")
-        if modlist[mod_name] ~= nil then
+        local found, _, mod_name, version = string.find(filename, "(.+)_([^_]+)")
+        if found ~= nil and module_info[mod_name] ~= nil and newer_than(version, module_info[mod_name].version) then
             if endswith(filename, ".zip") then
                 local info = ZipModule.new(mod_dir, string.sub(filename, 1, -5))
                 module_info[mod_name] = info
@@ -80,7 +123,9 @@ function Loader.load_data(game_path, mod_dir)
             for name, mod in pairs(package.loaded) do
                 loaded[name] = mod
             end
+            table.insert(package.searchers, 1, module_info)
             info:run(filename)
+            table.remove(package.searchers, 1)
             for name, mod in pairs(package.loaded) do
                 if loaded[name] == nil then
                     package.loaded[name] = nil
@@ -266,6 +311,20 @@ function Module:locale(locales)
             end
         end
     end
+end
+function Module:__call(name)
+  local file_path = self.localPath .. "/" .. string.gsub(name, "%.", "/") .. ".lua"
+  local f = io.open(file_path, "r")
+  if f ~= nil then
+    local content = f:read("*a")
+    f:close()
+    local loaded = load(content, file_path)
+    return function()
+      return loaded()
+    end
+  else
+    return "\n        no file " .. name .. " in " .. self.localPath .. " (Module loader)"
+  end
 end
 
 ZipModule = {}

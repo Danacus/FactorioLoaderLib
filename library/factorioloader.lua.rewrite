@@ -1,0 +1,503 @@
+local SettingLoader = require("library/settingloader")
+local CFGParser = require("library/cfgparser")
+
+require("library/factorioglobals")
+JSON = require("externals/JSON")
+require("lfs")
+require("zip")
+
+function endswith(s, sub)
+  return string.sub(s, -string.len(sub)) == sub
+end
+
+-- Factorio loads all mods names=>versions into a global table
+mods = {}
+
+Searcher = {}
+setmetatable(Searcher, {
+    __call =
+      function(t, name)
+        local found, e, mod = string.find(name, "^__(.*)__[%./]")
+        if found then
+          local loader = t.loaders[mod].loader
+          return loader(string.sub(name, e + 1))
+        end
+        return "\n        " .. name .. " doesn't look like a cross-module path (Searcher)"
+      end
+})
+
+LoadState = {
+  UNLOADED = 0,
+  LOADING = 1,
+  LOADED = 2,
+}
+
+Loader = {}
+
+function Loader.load_data(game_path, mod_dir)
+  -- This is a global on purpose so mods can reference it when they're loading
+  settings = SettingLoader.load(mod_dir .. "/mod-settings.dat")
+  table.insert(package.searchers, 2, Searcher)
+  -- load enabled mods from mod-list.json
+  Searcher.loaders = Loader.get_mod_list(mod_dir)
+  -- set up zip loader for each enabled mod, looking for the latest version of each mod
+  for filename in lfs.dir(mod_dir) do
+    local found, _, mod_name, mod_version = string.find(filename, "(.+)_([^_]+).zip")
+    if found ~= nil then
+      local mod_version = Version:new(mod_version)
+      if Searcher.loaders[mod_name] ~= nil then
+        if endswith(filename, ".zip") then
+          if mod_version > Searcher.loaders[mod_name].version then
+            Searcher.loaders[mod_name].loader = ZipLoader:new(mod_dir, filename)
+            Searcher.loaders[mod_name].version = mod_version
+          end
+        else
+          error("Loading unzipped mods is not supported")
+        end
+      end
+    end
+  end
+
+  builtin_mods = { "base", "core" }
+  for i = 1, #builtin_mods do
+    Loader.prep_builtin(game_path, builtin_mods[i])
+  end
+
+  -- load all mod names and versions into the global mods table
+  for mod, loader in pairs(Searcher.loaders) do
+    mods[mod] = loader.version
+  end
+
+  local filenames = {"data", "data-updates", "data-final-fixes"}
+  -- all mods can require from this directory at any time
+  --package.path = Searcher.loaders["core"].loader.folder .. "/lualib/?.lua;" .. package.path
+  package.path = Searcher.loaders["core"].loader.folder .. "/lualib/?.lua"
+  -- start with the special file in core that defines the "data" table, under core/lualib/
+  require("dataloader")
+  for _, filename in ipairs(filenames) do
+    Searcher.loaders["core"].loader:run(filename)
+    Searcher.loaders["base"].loader:run(filename)
+    local load_queue = {}
+    for name, mod in pairs(Searcher.loaders) do
+      mod.state[filename] = LoadState.UNLOADED
+      table.insert(load_queue, name)
+    end
+    -- mods are loaded alphabetically when there are no dependency constraints
+    table.sort(load_queue)
+    Loader.run_queue(filename, load_queue)
+  end
+  table.remove(package.searchers, 2)
+
+  local locales = {}
+  function locales:extend(data)
+    if data ~= nil then
+      for locale, locale_data in pairs(data) do
+        self[locale] = self[locale] or Locale:new(locale)
+        self[locale]:extend(locale_data)
+      end
+    end
+  end
+  for module_name, mod_info in pairs(Searcher.loaders) do
+    locales:extend(mod_info.loader:locale_data())
+  end
+
+  data.raw.module_info = {}
+  for mod_name, mod_info in pairs(Searcher.loaders) do
+    data.raw.module_info[mod_name] = {
+      mod_name = mod_name,
+      version = tostring(mod_info.version),
+    }
+  end
+  -- for some reason, this was built to expect load_data to only return
+  -- information about locales
+  return locales
+end
+
+function Loader.run_queue(filename, queue)
+  while #queue > 0 do
+    local current_mod_name = table.remove(queue, 1)
+    local current = Searcher.loaders[current_mod_name]
+    if current.state[filename] == LoadState.LOADING then
+      error("detected dependency loop")
+    elseif current.state[filename] ~= LoadState.LOADED then
+      current.state[filename] = LoadState.LOADING
+      local subqueue = {}
+      for _, dep in ipairs(current.loader:get_dependencies()) do
+        if dep:incompatible() then
+          if Searcher.loaders[dep.name] ~= nil then
+            error(current.name .. " conflicts with " .. dep.name)
+          end
+        elseif dep:optional() then
+          -- TODO ensure valid version
+          if Searcher.loaders[dep.name] ~= nil then
+            table.insert(subqueue, dep.name)
+          end
+        else -- dep:required()
+          -- TODO ensure valid version
+          if Searcher.loaders[dep.name] == nil then
+            error(current_mod_name .. " requires " .. tostring(dep))
+          else
+            table.insert(subqueue, dep.name)
+          end
+        end
+      end
+      table.sort(subqueue)
+      Loader.run_queue(filename, subqueue)
+      current.loader:run(filename)
+      current.state[filename] = LoadState.LOADED
+    end
+  end
+end
+
+function Loader.prep_builtin(game_path, mod_name)
+  local dir = game_path .. "/data/" .. mod_name
+  local loader = FolderLoader:new(dir)
+  Searcher.loaders[mod_name] = {
+    state = {},
+    loader = loader,
+    version = Version:new(loader:get_info().version),
+  }
+end
+
+function Loader.get_mod_list(mod_dir)
+  local f = assert(io.open(mod_dir .. "/mod-list.json"))
+  local s = f:read("*a")
+  local modlist = JSON:decode(s)
+  f:close()
+  local modnames = {}
+  for _, mod in pairs(modlist.mods) do
+    if mod.enabled and mod.name ~= "base" and mod.name ~= "scenario-pack" then
+      modnames[mod.name] = { state = {} }
+    end
+  end
+  return modnames
+end
+
+ZipLoader = {}
+ZipLoader.__index = ZipLoader
+function ZipLoader:new(dir, filename)
+  local z = assert(zip.open(dir .. "/" .. filename))
+  local v = {
+    zfile = z,
+    filename = filename,
+    paths = {},
+    loaded = {},
+  }
+  setmetatable(v, self)
+  table.insert(v.paths, v:get_top_folder())
+  return v
+end
+
+function ZipLoader:get_info()
+  if self.info ~= nil then return self.info end
+  local info_file = nil
+  for file in self.zfile:files() do
+    local found, _ = string.find(file.filename, "info.json", 1, true)
+    if found ~= nil then
+      -- makes subsequent calls to get_top_folder() a noop since we already
+      -- have a filename, not used in this function though
+      local first_separator, _ = string.find(file.filename, "/")
+      self.top_folder = string.sub(file.filename, 1, first_separator - 1)
+      info_file = self.zfile:open(file.filename)
+      break
+    end
+  end
+  assert(info_file, "Zip doesn't contain info.json: " .. self.filename)
+  local s = info_file:read("*a")
+  self.info = JSON:decode(s)
+  info_file:close()
+  return self.info
+end
+
+function ZipLoader:get_top_folder()
+  if self.top_folder ~= nil then return self.top_folder end
+  local files = self.zfile:files()
+  -- TODO: this assumes there's always one single top folder, is that always true?
+  local file = files() -- get the first file, doesn't matter which one
+  local first_separator, _ = string.find(file.filename, "/")
+  self.top_folder = string.sub(file.filename, 1, first_separator - 1)
+  return self.top_folder
+end
+
+function ZipLoader:get_dependencies()
+  if self.deps ~= nil then return self.deps end
+  self.deps = {}
+  local i = self:get_info()
+  if i.dependencies ~= nil then
+    for _, d in ipairs(i.dependencies) do
+      table.insert(self.deps, Dependency:new(d))
+    end
+  end
+  return self.deps
+end
+
+function ZipLoader:run(file)
+  table.insert(package.searchers, 2, self)
+  -- reset the loaded mods in case multiple mods share the same filenames or paths
+  for k in pairs(package.loaded) do
+    package.loaded[k] = nil
+  end
+  -- mods aren't required to define these files, so only load if the file exists
+  local found = self:search_paths(file)
+  if found then
+    print("ZipLoader:run(" .. file .. "): " .. found)
+    require(file)
+  end
+  table.remove(package.searchers, 2)
+end
+
+function ZipLoader:search_paths(file)
+  file = string.gsub(file, "%.", "/")
+  for _, path in pairs(self.paths) do
+    local fullpath = path .. "/" .. file .. ".lua"
+    for f in self.zfile:files() do
+      if fullpath == f.filename then
+        return f.filename
+      end
+    end
+  end
+end
+
+function ZipLoader:__call(file)
+  if self.loaded[file] ~= nil then
+    return function(_, value)
+      return value
+    end, self.loaded[file]
+  end
+  local full_filename = self:search_paths(file)
+  print("ZipLoader:__call(" .. file .. ")")
+  if full_filename == nil then
+    return "\n        no file " .. file .. ".lua in " .. self.filename .. " (ZipLoader)"
+  end
+  local f = self.zfile:open(full_filename)
+  local content = f:read("*a")
+  f:close()
+  local loaded = load(content, full_filename)
+  return function(_, loader)
+    table.insert(loader.paths, 1, string.sub(full_filename, 1, string.find(full_filename, "/[^/]*$") - 1))
+    loader.loaded[file] = loaded()
+    table.remove(loader.paths, 1)
+    return loader.loaded[file]
+  end, self
+end
+
+function ZipLoader:locale_data()
+  local pattern = self:get_top_folder() .. "/locale/([^/]+)/.+%.cfg$"
+  local res = nil
+  for info in self.zfile:files() do
+    local locale = info.filename:match(pattern)
+    if locale ~= nil then
+      local f = self.zfile:open(info.filename)
+      res = res or {}
+      res[locale] = res[locale] or {}
+      CFGParser.parse(f, res[locale])
+      f:close()
+    end
+  end
+  return res
+end
+
+FolderLoader = {}
+FolderLoader.__index = FolderLoader
+function FolderLoader:new(folder)
+  local v = {
+    folder = folder,
+    loaded = {},
+  }
+  return setmetatable(v, self)
+end
+
+function FolderLoader:run(file)
+  table.insert(package.searchers, 2, self)
+  -- reset the loaded mods in case multiple mods share the same filenames or paths
+  for k in pairs(package.loaded) do
+    package.loaded[k] = nil
+  end
+  print("loading " .. self.folder .. "/" .. file .. ".lua")
+  local found, _ = package.searchpath(file, self.folder .. "/?.lua;" .. package.path)
+  if found ~= nil then
+    require(file)
+  end
+  table.remove(package.searchers, 2)
+  local old_path = package.path
+  package.path = self.folder .. "/?.lua;" .. package.path
+  -- reset the loaded mods in case multiple mods share the same filenames or paths
+  for k in pairs(package.loaded) do
+    package.loaded[k] = nil
+  end
+  -- mods aren't required to define these files, so no need to fail the require
+  print("loading " .. self.folder .. "/" .. file .. ".lua")
+  local found, _ = package.searchpath(file, package.path)
+  if found ~= nil then
+    require(file)
+  end
+  package.path = old_path
+end
+
+function FolderLoader:get_info()
+  if self.info ~= nil then return self.info end
+  local info_file = assert(io.open(self.folder .. "/info.json"))
+  local s = info_file:read("*a")
+  self.info = JSON:decode(s)
+  info_file:close()
+  return self.info
+end
+
+function FolderLoader:get_dependencies()
+  -- TODO: currently only base/core use this, which have special dependency
+  -- handling, and therefore this is a noop. No use implementing right now.
+  return {}
+end
+
+function FolderLoader:__call(file)
+  if self.loaded[file] ~= nil then
+    return function(_, value)
+      return value
+    end, self.loaded[file]
+  end
+  local full_filename, _ = package.searchpath(file, self.folder .. "/?.lua;" .. package.path)
+  if full_filename == nil then
+    return "\n        no file " .. file .. ".lua in " .. self.folder .. " (FolderLoader)"
+  end
+  local loaded = loadfile(full_filename)
+  return function(_, loader)
+    local old_path = package.path
+    package.path = loader.folder .. "/?.lua;" .. package.path
+    loader.loaded[file] = loaded()
+    package.path = old_path
+    return loader.loaded[file]
+  end, self
+end
+
+function FolderLoader:locale_data()
+  local locale_dir = self.folder .. "/locale"
+  if lfs.attributes(locale_dir, "mode") ~= "directory" then return end
+  local res = nil
+  for locale in lfs.dir(locale_dir) do
+    if locale ~= "." and locale ~= ".." then
+      local d = locale_dir .. "/" .. locale
+      if lfs.attributes(d, "mode") == "directory" then
+        for filename in lfs.dir(d) do
+          if filename ~= "." and filename ~= ".." then
+            if filename:sub(-4):lower() == ".cfg" then
+              local f = assert(io.open(d .. "/" .. filename, "r"))
+              res = res or {}
+              res[locale] = res[locale] or {}
+              CFGParser.parse(f, res[locale])
+              f:close()
+            end
+          end
+        end
+      end
+    end
+  end
+  return res
+end
+
+DependencyKind = {
+  REQUIRED = 1,
+  OPTIONAL = 2,
+  INCOMPATIBLE = 3,
+}
+function DependencyKind.to_string(value)
+  if value == DependencyKind.REQUIRED then
+    return "required"
+  elseif value == DependencyKind.OPTIONAL then
+    return "optional"
+  elseif value == DependencyKind.INCOMPATIBLE then
+    return "incompatible"
+  else
+    error("Unknown DependencyKind value: " .. value)
+  end
+end
+function DependencyKind.from_string(value)
+  if value == "!" then
+    return DependencyKind.REQUIRED
+  elseif value == "?" or value == "(?)" then
+    return DependencyKind.OPTIONAL
+  else
+    return DependencyKind.REQUIRED
+  end
+end
+
+Dependency = {}
+Dependency.__index = Dependency
+function Dependency:new(spec)
+  local _, e, kind = string.find(spec, "^(%(?[?!]?%)?)%s*")
+  spec = string.sub(spec, e + 1)
+  local _, e, name = string.find(spec, "^([^%s]+)%s*")
+  assert(name, "Couldn't parse name from spec: " .. spec)
+  spec = string.sub(spec, e + 1)
+  local _, e, req = string.find(spec, "^([<>=]*)%s*")
+  spec = string.sub(spec, e + 1)
+  local version = nil
+  if req ~= nil then
+    local _, e, v = string.find(spec, "^([%d.]+)")
+    version = v
+  end
+  -- TODO: assert string is empty?
+  local d = {
+    kind = DependencyKind.from_string(kind),
+    name = name,
+    req = req,
+    version = version, -- TODO make Version object?
+  }
+  return setmetatable(d, Dependency)
+end
+
+function Dependency:required()
+  return self.kind == DependencyKind.REQUIRED
+end
+
+function Dependency:optional()
+  return self.kind == DependencyKind.OPTIONAL
+end
+
+function Dependency:incompatible()
+  return self.kind == DependencyKind.INCOMPATIBLE
+end
+
+function Dependency:__tostring()
+  return "Dependency<" .. self.name .. "," .. DependencyKind.to_string(self.kind) .. ">"
+end
+
+Version = {}
+function Version:new(str)
+  -- core doesn't define a version, and really only needs a dummy version anyway
+  str = str or "0.0.0"
+  local matcher = string.gmatch(str, "[^%.]*")
+  local v = {
+    major = tonumber(matcher()),
+    minor = tonumber(matcher()),
+    patch = tonumber(matcher()),
+  }
+  return setmetatable(v, self)
+end
+
+function Version.__tostring(tbl)
+  return tbl.major .. "." .. tbl.minor .. "." .. tbl.patch
+end
+
+function Version.__lt(op1, op2)
+  -- nil is always less than a defined version
+  if op1 == nil then return true end
+  return op1.major < op2.major or op1.minor < op2.minor or op1.patch < op2.patch
+end
+
+Locale = {}
+Locale.__index = Locale
+function Locale:new(name)
+  local v = { name = name }
+  return setmetatable(v, self)
+end
+
+function Locale:extend(data)
+  for section, values in pairs(data) do
+    self[section] = self[section] or {}
+    for key, value in pairs(values) do
+      self[section][key] = value
+    end
+  end
+end
+
+return Loader
